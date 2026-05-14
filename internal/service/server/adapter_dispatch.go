@@ -1085,6 +1085,44 @@ func (s *Server) handleAdapterStream(
 
 	// Record usage statistics after stream completes.
 
+	// Remember reasoning content for DeepSeek thinking replay via StreamInterceptor.
+	// This must not depend on trace being enabled.
+	if s.pluginRegistry != nil && sess != nil {
+		if anthProvider, ok := s.adapterRegistry.GetProvider(config.ProtocolAnthropic); ok {
+			if anthAdapter, ok := anthProvider.(*anthropic.AnthropicProviderAdapter); ok {
+				events := anthAdapter.StreamBuffer()
+				if len(events) > 0 {
+					states := s.pluginRegistry.NewStreamStates(openAIReq.Model)
+					for _, ev := range events {
+						pluginType := ""
+						switch {
+						case ev.Type == "content_block_start":
+							pluginType = "block_start"
+						case ev.Type == "content_block_delta":
+							pluginType = "block_delta"
+						case ev.Type == "content_block_stop":
+							pluginType = "block_stop"
+						}
+						if pluginType == "" {
+							continue
+						}
+						s.pluginRegistry.OnStreamEvent(openAIReq.Model, plugin.StreamEvent{
+							Type:  pluginType,
+							Index: ev.Index,
+							Block: anthropicContentBlockPtrToFormat(ev.ContentBlock),
+							Delta: ev.Delta,
+						}, states)
+					}
+					outputText := ""
+					if finalResp != nil {
+						outputText = finalResp.OutputText
+					}
+					s.pluginRegistry.OnStreamComplete(openAIReq.Model, states, outputText, sess.ExtensionData)
+				}
+			}
+		}
+	}
+
 	// Capture stream events for trace.
 	if s.tracer != nil && s.tracer.Enabled() {
 		// OpenAI stream events from client adapter
@@ -1102,42 +1140,6 @@ func (s *Server) handleAdapterStream(
 					streamRecord.AnthropicStreamEvents = events
 				}
 
-				// Remember reasoning content for DeepSeek thinking replay via StreamInterceptor.
-				if anthProvider2, ok := s.adapterRegistry.GetProvider(config.ProtocolAnthropic); ok {
-					if anthAdapter2, ok := anthProvider2.(*anthropic.AnthropicProviderAdapter); ok {
-						if s.pluginRegistry != nil && sess != nil {
-							events := anthAdapter2.StreamBuffer()
-							if len(events) > 0 {
-								states := s.pluginRegistry.NewStreamStates(openAIReq.Model)
-								for _, ev := range events {
-									pluginType := ""
-									switch {
-									case ev.Type == "content_block_start":
-										pluginType = "block_start"
-									case ev.Type == "content_block_delta":
-										pluginType = "block_delta"
-									case ev.Type == "content_block_stop":
-										pluginType = "block_stop"
-									}
-									if pluginType == "" {
-										continue
-									}
-									s.pluginRegistry.OnStreamEvent(openAIReq.Model, plugin.StreamEvent{
-										Type:  pluginType,
-										Index: ev.Index,
-										Block: anthropicContentBlockPtrToFormat(ev.ContentBlock),
-										Delta: ev.Delta,
-									}, states)
-								}
-								outputText := ""
-								if finalResp != nil {
-									outputText = finalResp.OutputText
-								}
-								s.pluginRegistry.OnStreamComplete(openAIReq.Model, states, outputText, sess.ExtensionData)
-							}
-						}
-					}
-				}
 				// Chat stream events from provider adapter
 				if chatProvider, ok := s.adapterRegistry.GetProvider(config.ProtocolOpenAIChat); ok {
 					if chatAdapter, ok := chatProvider.(*chat.ChatProviderAdapter); ok {
@@ -1452,6 +1454,9 @@ func injectAnthropicWebSearch(req *anthropic.MessageRequest) {
 // contains the tool_use, because in follow-up requests the last message
 // is typically a user tool_result.
 func prependCachedThinking(upstreamReq *anthropic.MessageRequest, sess *session.Session) {
+	if upstreamReq == nil || sess == nil || sess.ExtensionData == nil {
+		return
+	}
 	stateRaw, ok := sess.ExtensionData["deepseek_v4"]
 	if !ok {
 		return
@@ -1467,23 +1472,37 @@ func prependCachedThinking(upstreamReq *anthropic.MessageRequest, sess *session.
 		if msg.Role != "assistant" || len(msg.Content) == 0 {
 			continue
 		}
+		// Only tool-call assistant messages require thinking replay fallback.
+		hasToolUse := false
+		for _, block := range msg.Content {
+			if block.Type == "tool_use" {
+				hasToolUse = true
+				break
+			}
+		}
+		if !hasToolUse {
+			continue
+		}
 		// Check if the message already has a thinking block.
 		if hasThinkingBlock(msg.Content) {
 			continue
 		}
 		// Try to prepend cached thinking by tool call ID (for tool_use messages).
+		foundCachedThinking := false
 		for _, block := range msg.Content {
-			if block.Type == "tool_use" && block.ID != "" {
-				if cached, ok := state.CachedForToolCall(block.ID); ok {
-					// Prepend thinking block directly to this message, not to the last message.
-					msg.Content = append([]anthropic.ContentBlock{normalizeThinkingBlock(cached)}, msg.Content...)
-				}
+			if block.Type != "tool_use" || block.ID == "" {
+				continue
+			}
+			if cached, ok := state.CachedForToolCall(block.ID); ok {
+				// Prepend thinking block directly to this message, not to the last message.
+				msg.Content = append([]anthropic.ContentBlock{normalizeThinkingBlock(cached)}, msg.Content...)
+				foundCachedThinking = true
 				break
 			}
 		}
 		// Fallback: prepend empty thinking block as response boundary.
 		// Prevents model from continuing previous response text.
-		if !hasThinkingBlock(msg.Content) {
+		if !foundCachedThinking && !hasThinkingBlock(msg.Content) {
 			prepended, _ := deepseekv4.PrependRequiredThinkingForAssistantText(anthropicContentSliceToFormat(msg.Content))
 			msg.Content = formatContentSliceToAnthropic(prepended)
 		}
@@ -1558,6 +1577,7 @@ func prependCachedReasoningForChat(chatReq *chat.ChatRequest, sess *session.Sess
 		// that the field is present on every assistant message.
 		if msg.ReasoningContent == "" && len(msg.ToolCalls) > 0 {
 			msg.ReasoningContent = ""
+			msg.EmitEmptyReasoningContent = true
 		}
 	}
 }

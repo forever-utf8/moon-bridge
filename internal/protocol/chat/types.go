@@ -10,32 +10,54 @@ import "encoding/json"
 // ChatRequest maps to OpenAI Chat Completions request body.
 // https://platform.openai.com/docs/api-reference/chat/create
 type ChatRequest struct {
-	Model            string          `json:"model"`
-	Messages         []ChatMessage   `json:"messages"`
-	Temperature      *float64        `json:"temperature,omitempty"`
-	TopP             *float64        `json:"top_p,omitempty"`
-	MaxTokens        int             `json:"max_completion_tokens,omitempty"`
-	Stop             []string        `json:"stop,omitempty"`
-	Stream           bool            `json:"stream,omitempty"`
-	Tools            []ChatTool      `json:"tools,omitempty"`
-	ToolChoice       json.RawMessage `json:"tool_choice,omitempty"`
-	ParallelToolCalls *bool          `json:"parallel_tool_calls,omitempty"`
-	StreamOptions    *StreamOptions  `json:"stream_options,omitempty"`
-	Metadata         map[string]any  `json:"metadata,omitempty"`
-	User             string          `json:"user,omitempty"`
+	Model             string          `json:"model"`
+	Messages          []ChatMessage   `json:"messages"`
+	Temperature       *float64        `json:"temperature,omitempty"`
+	TopP              *float64        `json:"top_p,omitempty"`
+	MaxTokens         int             `json:"max_completion_tokens,omitempty"`
+	Stop              []string        `json:"stop,omitempty"`
+	Stream            bool            `json:"stream,omitempty"`
+	Tools             []ChatTool      `json:"tools,omitempty"`
+	ToolChoice        json.RawMessage `json:"tool_choice,omitempty"`
+	ParallelToolCalls *bool           `json:"parallel_tool_calls,omitempty"`
+	StreamOptions     *StreamOptions  `json:"stream_options,omitempty"`
+	Metadata          map[string]any  `json:"metadata,omitempty"`
+	User              string          `json:"user,omitempty"`
 }
 
 // ChatMessage represents a single message in the conversation.
 type ChatMessage struct {
-	Role       string      `json:"role"` // "system" | "user" | "assistant" | "tool"
-	Content    any         `json:"content,omitempty"` // string or []ContentPart
-	ToolCalls  []ToolCall  `json:"tool_calls,omitempty"`
-	ToolCallID string      `json:"tool_call_id,omitempty"`
-	Name       string      `json:"name,omitempty"`
+	Role       string     `json:"role"`              // "system" | "user" | "assistant" | "tool"
+	Content    any        `json:"content,omitempty"` // string or []ContentPart
+	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
+	ToolCallID string     `json:"tool_call_id,omitempty"`
+	Name       string     `json:"name,omitempty"`
 	// ReasoningContent is a non-standard field used by providers like DeepSeek
 	// to return chain-of-thought reasoning. When present, it must be echoed
 	// back in follow-up assistant messages.
 	ReasoningContent string `json:"reasoning_content,omitempty"`
+	// EmitEmptyReasoningContent forces JSON serialization of reasoning_content
+	// as an explicit empty string when ReasoningContent == "". This is used by
+	// DeepSeek fallback replay for assistant tool-call messages.
+	EmitEmptyReasoningContent bool `json:"-"`
+}
+
+// MarshalJSON preserves normal omitempty behavior, except when
+// EmitEmptyReasoningContent is true — then reasoning_content is emitted as "".
+func (message ChatMessage) MarshalJSON() ([]byte, error) {
+	type alias ChatMessage
+	base := struct {
+		alias
+		ReasoningContent *string `json:"reasoning_content,omitempty"`
+	}{
+		alias: alias(message),
+	}
+	base.alias.EmitEmptyReasoningContent = false
+	if message.ReasoningContent != "" || message.EmitEmptyReasoningContent {
+		value := message.ReasoningContent
+		base.ReasoningContent = &value
+	}
+	return json.Marshal(base)
 }
 
 // ContentPart is a multimodal content part (text or image_url).
@@ -99,9 +121,9 @@ type ChatResponse struct {
 
 // Choice represents a single completion choice in a non-streaming response.
 type Choice struct {
-	Index        int          `json:"index"`
-	Message      ChatMessage  `json:"message"`
-	FinishReason string       `json:"finish_reason"`
+	Index        int         `json:"index"`
+	Message      ChatMessage `json:"message"`
+	FinishReason string      `json:"finish_reason"`
 }
 
 // Usage reports token usage from the API response.
@@ -128,19 +150,19 @@ type PromptTokensDetails struct {
 // Each data: line contains one ChatStreamChunk.
 // The final chunk before the data: [DONE] marker may contain usage.
 type ChatStreamChunk struct {
-	ID      string          `json:"id"`
-	Object  string          `json:"object"`
-	Created int64           `json:"created"`
-	Model   string          `json:"model"`
-	Choices []StreamChoice  `json:"choices"`
-	Usage   *Usage          `json:"usage,omitempty"` // only on final chunk when stream_options.include_usage
+	ID      string         `json:"id"`
+	Object  string         `json:"object"`
+	Created int64          `json:"created"`
+	Model   string         `json:"model"`
+	Choices []StreamChoice `json:"choices"`
+	Usage   *Usage         `json:"usage,omitempty"` // only on final chunk when stream_options.include_usage
 }
 
 // StreamChoice represents a single streaming choice with delta content.
 type StreamChoice struct {
-	Index        int      `json:"index"`
-	Delta        Delta    `json:"delta"`
-	FinishReason string   `json:"finish_reason,omitempty"`
+	Index        int    `json:"index"`
+	Delta        Delta  `json:"delta"`
+	FinishReason string `json:"finish_reason,omitempty"`
 }
 
 // Delta contains the incremental content for a streaming choice.

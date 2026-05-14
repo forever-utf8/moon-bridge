@@ -12,8 +12,8 @@ import (
 	"strings"
 	"testing"
 
-	"moonbridge/internal/protocol/chat"
 	"moonbridge/internal/format"
+	"moonbridge/internal/protocol/chat"
 )
 
 // ============================================================================
@@ -105,6 +105,32 @@ func TestTypes_ChatRequest_JSON(t *testing.T) {
 	}
 	if out.Stream {
 		t.Error("Stream should be false")
+	}
+}
+
+func TestTypes_ChatMessage_MarshalJSON_EmitsEmptyReasoningContentWhenForced(t *testing.T) {
+	message := chat.ChatMessage{
+		Role:                      "assistant",
+		ToolCalls:                 []chat.ToolCall{{ID: "call_1", Type: "function", Function: chat.ToolCallFunc{Name: "exec_command", Arguments: json.RawMessage(`{}`)}}},
+		ReasoningContent:          "",
+		EmitEmptyReasoningContent: true,
+	}
+
+	data, err := json.Marshal(message)
+	if err != nil {
+		t.Fatalf("Marshal(ChatMessage) error = %v", err)
+	}
+	if !strings.Contains(string(data), `"reasoning_content":""`) {
+		t.Fatalf("expected reasoning_content to be explicitly present, got %s", string(data))
+	}
+
+	message.EmitEmptyReasoningContent = false
+	data2, err := json.Marshal(message)
+	if err != nil {
+		t.Fatalf("Marshal(ChatMessage) error = %v", err)
+	}
+	if strings.Contains(string(data2), `"reasoning_content":""`) {
+		t.Fatalf("reasoning_content should be omitted without force flag, got %s", string(data2))
 	}
 }
 
@@ -1039,8 +1065,8 @@ func TestFromCoreRequest_ToolChoice(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			r := &format.CoreRequest{
-				Model:    "gpt-4o",
-				Messages: []format.CoreMessage{{Role: "user", Content: []format.CoreContentBlock{{Type: "text", Text: "hi"}}}},
+				Model:      "gpt-4o",
+				Messages:   []format.CoreMessage{{Role: "user", Content: []format.CoreContentBlock{{Type: "text", Text: "hi"}}}},
 				ToolChoice: &format.CoreToolChoice{Mode: tt.mode, Name: tt.tname},
 			}
 			result, err := adapter.FromCoreRequest(context.Background(), r)
@@ -1271,8 +1297,8 @@ func TestFromCoreRequest_RawToolChoice(t *testing.T) {
 	adapter := newTestAdapter()
 	raw := json.RawMessage(`{"type":"function","function":{"name":"my_tool"}}`)
 	result, err := adapter.FromCoreRequest(context.Background(), &format.CoreRequest{
-		Model:    "gpt-4o",
-		Messages: []format.CoreMessage{{Role: "user", Content: []format.CoreContentBlock{{Type: "text", Text: "hi"}}}},
+		Model:      "gpt-4o",
+		Messages:   []format.CoreMessage{{Role: "user", Content: []format.CoreContentBlock{{Type: "text", Text: "hi"}}}},
 		ToolChoice: &format.CoreToolChoice{Raw: raw},
 	})
 	if err != nil {
@@ -1319,8 +1345,8 @@ func TestToCoreResponse_BasicText(t *testing.T) {
 	chatResp := &chat.ChatResponse{
 		ID: "chatcmpl-1",
 		Choices: []chat.Choice{{
-			Index: 0,
-			Message: chat.ChatMessage{Role: "assistant", Content: "Hello!"},
+			Index:        0,
+			Message:      chat.ChatMessage{Role: "assistant", Content: "Hello!"},
 			FinishReason: "stop",
 		}},
 		Usage: &chat.Usage{PromptTokens: 5, CompletionTokens: 10, TotalTokens: 15},
@@ -1903,8 +1929,8 @@ func TestFromCoreRequest_ToolChoiceUnknownMode(t *testing.T) {
 	adapter := newTestAdapter()
 	t.Run("unknown mode without name", func(t *testing.T) {
 		result, err := adapter.FromCoreRequest(context.Background(), &format.CoreRequest{
-			Model:    "gpt-4o",
-			Messages: []format.CoreMessage{{Role: "user", Content: []format.CoreContentBlock{{Type: "text", Text: "hi"}}}},
+			Model:      "gpt-4o",
+			Messages:   []format.CoreMessage{{Role: "user", Content: []format.CoreContentBlock{{Type: "text", Text: "hi"}}}},
 			ToolChoice: &format.CoreToolChoice{Mode: "unknown_mode"},
 		})
 		if err != nil {
@@ -1922,8 +1948,8 @@ func TestFromCoreRequest_ToolChoiceUnknownMode(t *testing.T) {
 	})
 	t.Run("unknown mode with name", func(t *testing.T) {
 		result, err := adapter.FromCoreRequest(context.Background(), &format.CoreRequest{
-			Model:    "gpt-4o",
-			Messages: []format.CoreMessage{{Role: "user", Content: []format.CoreContentBlock{{Type: "text", Text: "hi"}}}},
+			Model:      "gpt-4o",
+			Messages:   []format.CoreMessage{{Role: "user", Content: []format.CoreContentBlock{{Type: "text", Text: "hi"}}}},
 			ToolChoice: &format.CoreToolChoice{Mode: "unknown_mode", Name: "my_tool"},
 		})
 		if err != nil {
@@ -2257,9 +2283,9 @@ func TestFromCoreRequest_DefaultContentBlockNoText(t *testing.T) {
 
 func TestNewClient_NormalizesBaseURL(t *testing.T) {
 	tests := []struct {
-		name     string
+		name      string
 		urlSuffix string // appended to srv.URL
-		wantPath string  // expected request path
+		wantPath  string // expected request path
 	}{
 		{"no /v1", "", "/v1/chat/completions"},
 		{"with /v1", "/v1", "/v1/chat/completions"},
