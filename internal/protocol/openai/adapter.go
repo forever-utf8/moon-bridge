@@ -1532,7 +1532,7 @@ func convertToolWithNamespace(tool Tool, namespace string) []format.CoreTool {
 			Description: tool.Description,
 			InputSchema: tool.Parameters,
 		}
-		codextool.AnnotateCoreTool(&ct, codextool.ToolFunction, name, namespace)
+		codextool.AnnotateCoreTool(&ct, codextool.ToolFunction, tool.Name, namespace)
 		return []format.CoreTool{ct}
 
 	case "web_search", "web_search_preview":
@@ -1581,13 +1581,13 @@ func convertToolWithNamespace(tool Tool, namespace string) []format.CoreTool {
 				Description: tool.Description,
 				InputSchema: codextool.LocalShellSchema(),
 			}
-			codextool.AnnotateCoreTool(&ct, codextool.ToolLocalShell, name, "")
+			codextool.AnnotateCoreTool(&ct, codextool.ToolLocalShell, tool.Name, "")
 			return []format.CoreTool{ct}
 		}
 		if codextool.IsApplyPatchGrammar(grammar) {
 			proxyTools := codextool.ApplyPatchProxyCoreTools(name)
 			for i := range proxyTools {
-				codextool.AnnotateCoreTool(&proxyTools[i], codextool.ToolApplyPatch, name, "")
+				codextool.AnnotateCoreTool(&proxyTools[i], codextool.ToolApplyPatch, tool.Name, "")
 			}
 			return proxyTools
 		}
@@ -1597,7 +1597,7 @@ func convertToolWithNamespace(tool Tool, namespace string) []format.CoreTool {
 				Description: codextool.ExecProxyDescription(),
 				InputSchema: codextool.ExecProxySchema(),
 			}
-			codextool.AnnotateCoreTool(&ct, codextool.ToolExec, name, "")
+			codextool.AnnotateCoreTool(&ct, codextool.ToolExec, tool.Name, "")
 			return []format.CoreTool{ct}
 		}
 		// Other custom tools: keep original name with raw input schema
@@ -1606,7 +1606,7 @@ func convertToolWithNamespace(tool Tool, namespace string) []format.CoreTool {
 			Description: customToolDescription(tool, grammar),
 			InputSchema: codextool.CustomToolInputSchema(grammar),
 		}
-		codextool.AnnotateCoreTool(&ct, codextool.ToolRaw, name, "")
+		codextool.AnnotateCoreTool(&ct, codextool.ToolRaw, tool.Name, "")
 		return []format.CoreTool{ct}
 
 	default:
