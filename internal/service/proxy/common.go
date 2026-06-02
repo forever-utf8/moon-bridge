@@ -2,11 +2,16 @@ package proxy
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strings"
+	"syscall"
+	"time"
 
 	mbtrace "moonbridge/internal/service/trace"
 )
@@ -127,4 +132,41 @@ func copyStreaming(writer http.ResponseWriter, reader io.Reader, capture *bytes.
 			return readErr
 		}
 	}
+}
+
+func isDownstreamCanceledError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, http.ErrAbortHandler) ||
+		errors.Is(err, syscall.EPIPE) || errors.Is(err, syscall.ECONNRESET) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "context canceled") ||
+		strings.Contains(msg, "broken pipe") ||
+		strings.Contains(msg, "connection reset by peer") ||
+		strings.Contains(msg, "client disconnected") ||
+		strings.Contains(msg, "stream closed")
+}
+
+func logResponseCopyIssue(log *slog.Logger, level slog.Level, message string, err error, request *http.Request, upstreamResponse *http.Response, targetURL string, copiedBytes int, elapsed time.Duration) {
+	args := []any{
+		"error", err,
+		"downstream_canceled", isDownstreamCanceledError(err),
+		"status", upstreamResponse.StatusCode,
+		"bytes", copiedBytes,
+		"duration_ms", elapsed.Milliseconds(),
+		"request_uri", request.URL.RequestURI(),
+		"remote", request.RemoteAddr,
+		"user_agent", request.UserAgent(),
+		"accept", request.Header.Get("Accept"),
+		"content_type", upstreamResponse.Header.Get("Content-Type"),
+		"content_length", upstreamResponse.ContentLength,
+		"transfer_encoding", strings.Join(upstreamResponse.TransferEncoding, ","),
+	}
+	if upstreamURL, parseErr := url.Parse(targetURL); parseErr == nil {
+		args = append(args, "upstream_host", upstreamURL.Host, "upstream_path", upstreamURL.Path)
+	}
+	log.Log(context.Background(), level, message, args...)
 }

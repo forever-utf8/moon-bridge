@@ -13,13 +13,13 @@ import (
 	"strings"
 	"testing"
 
+	"moonbridge/internal/config"
 	"moonbridge/internal/extension/codex"
 	deepseekv4 "moonbridge/internal/extension/deepseek_v4"
 	"moonbridge/internal/extension/plugin"
-	"moonbridge/internal/config"
+	"moonbridge/internal/format"
 	"moonbridge/internal/logger"
 	"moonbridge/internal/protocol/openai"
-	"moonbridge/internal/format"
 	"moonbridge/internal/service/provider"
 	"moonbridge/internal/service/server"
 	"moonbridge/internal/service/stats"
@@ -82,11 +82,27 @@ func (provider providerFunc) StreamMessage(ctx context.Context, req any) (<-chan
 	return provider.stream(ctx, req)
 }
 
-
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (fn roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
 	return fn(request)
+}
+
+func findLogEntry(buf *bytes.Buffer, msg string) map[string]any {
+	for _, line := range strings.Split(buf.String(), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		var entry map[string]any
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			continue
+		}
+		if entry["msg"] == msg {
+			return entry
+		}
+	}
+	return nil
 }
 
 type captureCompletionPlugin struct {
@@ -821,6 +837,224 @@ func TestOpenAIResponsePassthroughWritesTraceOnSuccess(t *testing.T) {
 			t.Fatalf("trace should not contain %q: %s", notWant, traceContent)
 		}
 	}
+}
+
+func TestOpenAIResponsePassthroughTreatsCanceledCopyAsClientDisconnect(t *testing.T) {
+	httpClient := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body: &canceledReadCloser{prefix: []byte(strings.Join([]string{
+				"event: response.created",
+				`data: {"type":"response.created","response":{"id":"resp_1"}}`,
+				"",
+				"event: response.output_text.delta",
+				`data: {"type":"response.output_text.delta","delta":"hello"}`,
+				"",
+				"event: response.output_text.delta",
+				`data: {"type":"response.output_text.delta","delta":"tail"}`,
+				"",
+			}, "\n"))},
+		}, nil
+	})}
+
+	providerMgr, err := provider.NewProviderManager(map[string]provider.ProviderConfig{
+		"openai": {
+			BaseURL:  "https://openai.example.test",
+			APIKey:   "openai-key",
+			Protocol: config.ProtocolOpenAIResponse,
+		},
+	}, map[string]provider.ModelRoute{
+		"gpt-direct": {Provider: "openai", Name: "gpt-upstream"},
+	})
+	if err != nil {
+		t.Fatalf("NewProviderManager() error = %v", err)
+	}
+	var logOutput bytes.Buffer
+	if err := logger.Init(logger.Config{Level: logger.LevelDebug, Format: "json", Output: &logOutput}); err != nil {
+		t.Fatalf("logger.Init() error = %v", err)
+	}
+	t.Cleanup(func() {
+		_ = logger.Init(logger.Config{Level: logger.LevelInfo, Format: "text", Output: os.Stderr})
+	})
+	capture := &captureCompletionPlugin{}
+	handler := server.New(server.Config{
+		ProviderMgr:      providerMgr,
+		OpenAIHTTPClient: httpClient,
+		PluginRegistry:   registryWithCompletionCapture(t, capture),
+	})
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewBufferString(`{"model":"gpt-direct","input":"hello","stream":true}`))
+	request.Header.Set("User-Agent", "codex-test")
+	request.Header.Set("Accept", "text/event-stream")
+	handler.ServeHTTP(recorder, request)
+
+	logs := logOutput.String()
+	if strings.Contains(logs, `"level":"ERROR"`) || strings.Contains(logs, "复制上游响应失败") {
+		t.Fatalf("canceled copy should not be logged as error: %s", logs)
+	}
+	if !strings.Contains(logs, "下游取消响应复制") {
+		t.Fatalf("missing downstream cancel debug log: %s", logs)
+	}
+	cancelEntry := findLogEntry(&logOutput, "下游取消响应复制")
+	if cancelEntry == nil {
+		t.Fatalf("missing parsed downstream cancel entry: %s", logs)
+	}
+	for _, want := range []string{
+		`"level":"WARN"`,
+		`"downstream_canceled":true`,
+		`"request_model":"gpt-direct"`,
+		`"actual_model":"gpt-upstream"`,
+		`"stream":true`,
+		`"status":200`,
+		`"bytes":274`,
+		`"content_type":"text/event-stream"`,
+		`"upstream_host":"openai.example.test"`,
+		`"upstream_path":"/v1/responses"`,
+		`"user_agent":"codex-test"`,
+		`"accept":"text/event-stream"`,
+		`"sse_events_seen":3`,
+		`"sse_data_messages":3`,
+		`"sse_last_event":"response.output_text.delta"`,
+		`"sse_last_data_type":"response.output_text.delta"`,
+		`"sse_saw_response_completed":false`,
+		`"sse_saw_error_event":false`,
+		`"sse_json_parse_errors":0`,
+		`"sse_event_counts":"response.created:1,response.output_text.delta:2"`,
+	} {
+		if !strings.Contains(logs, want) {
+			t.Fatalf("diagnostic log missing %q: %s", want, logs)
+		}
+	}
+	tail, ok := cancelEntry["sse_tail"].(string)
+	if !ok {
+		t.Fatalf("sse_tail missing or non-string: %+v", cancelEntry)
+	}
+	for _, want := range []string{
+		`event: response.created`,
+		`data: {"type":"response.created","response":{"id":"resp_1"}}`,
+		`data: {"type":"response.output_text.delta","delta":"tail"}`,
+	} {
+		if !strings.Contains(tail, want) {
+			t.Fatalf("sse_tail missing %q: %q", want, tail)
+		}
+	}
+	if capture.called {
+		t.Fatalf("completion hook should not be called after canceled copy: %+v", capture.result)
+	}
+}
+
+func TestOpenAIResponsePassthroughLogsCompletedStreamCloseAsInfo(t *testing.T) {
+	body := strings.Join([]string{
+		"event: response.created",
+		`data: {"type":"response.created","response":{"id":"resp_1"}}`,
+		"",
+		"event: response.completed",
+		`data: {"type":"response.completed","response":{"id":"resp_1","status":"completed"}}`,
+		"",
+	}, "\n")
+	httpClient := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       &canceledReadCloser{prefix: []byte(body)},
+		}, nil
+	})}
+
+	providerMgr, err := provider.NewProviderManager(map[string]provider.ProviderConfig{
+		"openai": {
+			BaseURL:  "https://openai.example.test",
+			APIKey:   "openai-key",
+			Protocol: config.ProtocolOpenAIResponse,
+		},
+	}, map[string]provider.ModelRoute{
+		"gpt-direct": {Provider: "openai", Name: "gpt-upstream"},
+	})
+	if err != nil {
+		t.Fatalf("NewProviderManager() error = %v", err)
+	}
+	var logOutput bytes.Buffer
+	if err := logger.Init(logger.Config{Level: logger.LevelDebug, Format: "json", Output: &logOutput}); err != nil {
+		t.Fatalf("logger.Init() error = %v", err)
+	}
+	t.Cleanup(func() {
+		_ = logger.Init(logger.Config{Level: logger.LevelInfo, Format: "text", Output: os.Stderr})
+	})
+	handler := server.New(server.Config{
+		ProviderMgr:      providerMgr,
+		OpenAIHTTPClient: httpClient,
+	})
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewBufferString(`{"model":"gpt-direct","input":"hello","stream":true}`))
+	handler.ServeHTTP(recorder, request)
+
+	logs := logOutput.String()
+	if strings.Contains(logs, `"level":"WARN"`) || strings.Contains(logs, "下游取消响应复制") {
+		t.Fatalf("completed stream close should not be logged as warn/cancel: %s", logs)
+	}
+	entry := findLogEntry(&logOutput, "响应流完成后下游关闭连接")
+	if entry == nil {
+		t.Fatalf("missing completed stream close log: %s", logs)
+	}
+	if _, ok := entry["sse_tail"]; ok {
+		t.Fatalf("completed stream close should not include sse_tail: %+v", entry)
+	}
+	for _, noisy := range []string{
+		"error",
+		"downstream_canceled",
+		"request_uri",
+		"remote",
+		"user_agent",
+		"accept",
+		"content_type",
+		"content_length",
+		"transfer_encoding",
+		"upstream_host",
+		"upstream_path",
+		"sse_events_seen",
+		"sse_data_messages",
+		"sse_last_event",
+		"sse_last_data_type",
+		"sse_saw_response_completed",
+		"sse_saw_error_event",
+		"sse_json_parse_errors",
+		"sse_event_counts",
+	} {
+		if _, ok := entry[noisy]; ok {
+			t.Fatalf("completed stream close should not include %q: %+v", noisy, entry)
+		}
+	}
+	for _, want := range []string{
+		`"level":"INFO"`,
+		`"request_model":"gpt-direct"`,
+		`"actual_model":"gpt-upstream"`,
+		`"stream":true`,
+		`"status":200`,
+		`"sse_completed":true`,
+	} {
+		if !strings.Contains(logs, want) {
+			t.Fatalf("completed stream log missing %q: %s", want, logs)
+		}
+	}
+}
+
+type canceledReadCloser struct {
+	prefix []byte
+}
+
+func (r *canceledReadCloser) Read(p []byte) (int, error) {
+	if len(r.prefix) > 0 {
+		n := copy(p, r.prefix)
+		r.prefix = r.prefix[n:]
+		return n, nil
+	}
+	return 0, context.Canceled
+}
+
+func (*canceledReadCloser) Close() error {
+	return nil
 }
 
 func TestInjectWebSearchToolAppendsWhenMissing(t *testing.T) {

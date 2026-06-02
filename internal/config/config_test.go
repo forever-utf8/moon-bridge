@@ -6,9 +6,9 @@ import (
 	"strings"
 	"testing"
 
+	"moonbridge/internal/config"
 	deepseekv4 "moonbridge/internal/extension/deepseek_v4"
 	"moonbridge/internal/extension/visual"
-	"moonbridge/internal/config"
 )
 
 func builtinExtensionSpecsForTest() []config.ExtensionConfigSpec {
@@ -156,6 +156,40 @@ web_search:
 	}
 	if cfg.WebSearchEnabled() {
 		t.Fatal("WebSearchEnabled() = true, want false")
+	}
+}
+
+func TestLoadFromYAMLProviderWebSearchOmittedInheritsGlobal(t *testing.T) {
+	cfg, err := config.LoadFromYAML([]byte(`
+mode: Transform
+models:
+  gpt-test: {}
+providers:
+  main:
+    base_url: https://provider.example.test
+    api_key: upstream-key
+    offers:
+      - model: gpt-test
+routes:
+  moonbridge:
+    model: gpt-test
+    provider: main
+web_search:
+  support: injected
+  tavily_api_key: tavily-key
+  search_max_rounds: 3
+`))
+	if err != nil {
+		t.Fatalf("LoadFromYAML() error = %v", err)
+	}
+	if cfg.WebSearchSupport != config.WebSearchSupportInjected {
+		t.Fatalf("WebSearchSupport = %q", cfg.WebSearchSupport)
+	}
+	if cfg.ProviderDefs["main"].WebSearchSupport != "" {
+		t.Fatalf("provider web search support = %q, want inherit/empty", cfg.ProviderDefs["main"].WebSearchSupport)
+	}
+	if got := cfg.WebSearchForProvider("main"); got != config.WebSearchSupportInjected {
+		t.Fatalf("WebSearchForProvider(main) = %q, want injected", got)
 	}
 }
 

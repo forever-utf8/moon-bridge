@@ -403,14 +403,25 @@ func resolveModelWebSearch(ctx context.Context, alias, providerKey, upstreamMode
 	case config.ProtocolAnthropic:
 	case config.ProtocolOpenAIResponse:
 		switch modelWS {
+		case config.WebSearchSupportEnabled:
+			pm.SetResolvedWebSearch(modelKey, "enabled")
+			pm.SetResolvedWebSearch(candidateKey, "enabled")
+			slog.Info("模型启用响应端网页搜索", "model", alias)
 		case config.WebSearchSupportDisabled, config.WebSearchSupportInjected:
 			pm.SetResolvedWebSearch(modelKey, "disabled")
 			pm.SetResolvedWebSearch(candidateKey, "disabled")
 			slog.Info("模型禁用响应端网页搜索", "model", alias, "config", modelWS)
 		default:
-			pm.SetResolvedWebSearch(modelKey, "enabled")
-			pm.SetResolvedWebSearch(candidateKey, "enabled")
-			slog.Info("模型启用响应端网页搜索", "model", alias)
+			resolved := pm.ResolvedWebSearchForCandidate(providerKey, upstreamModel)
+			if resolved == "" {
+				resolved = pm.ResolvedWebSearch(providerKey)
+			}
+			if resolved == "" || resolved == "injected" {
+				resolved = "disabled"
+			}
+			pm.SetResolvedWebSearch(modelKey, resolved)
+			pm.SetResolvedWebSearch(candidateKey, resolved)
+			slog.Info("模型继承响应端网页搜索配置", "model", alias, "provider", providerKey, "resolved", resolved)
 		}
 		return
 	default:

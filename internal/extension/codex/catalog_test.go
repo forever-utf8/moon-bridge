@@ -519,6 +519,117 @@ func TestGenerateConfigTomlWritesAuthJSONWithOwnerOnlyPermissions(t *testing.T) 
 	}
 }
 
+func TestGenerateConfigTomlIgnoresComputerUseOutsideOutputCodexHome(t *testing.T) {
+	installedCodexHome := t.TempDir()
+	outputCodexHome := t.TempDir()
+	t.Setenv("CODEX_HOME", installedCodexHome)
+	writeComputerUseClient(t, installedCodexHome)
+
+	var output bytes.Buffer
+	cfg := config.Config{
+		Models: map[string]config.ModelDef{
+			"gpt-test": {ContextWindow: 128000},
+		},
+		ProviderDefs: map[string]config.ProviderDef{
+			"openai": {
+				Offers: []config.OfferEntry{{Model: "gpt-test"}},
+			},
+		},
+		Routes: map[string]config.RouteEntry{
+			"test": {Provider: "openai", Model: "gpt-test"},
+		},
+	}
+
+	err := codex.GenerateConfigToml(&output, "test", "http://127.0.0.1:38440/v1", outputCodexHome,
+		config.ProviderFromGlobalConfig(&cfg), config.PluginFromGlobalConfig(&cfg), config.ServerFromGlobalConfig(&cfg))
+	if err != nil {
+		t.Fatalf("GenerateConfigToml() error = %v", err)
+	}
+	if strings.Contains(output.String(), `[plugins."computer-use@openai-bundled"]`) {
+		t.Fatalf("generated config should ignore computer-use outside output codex home:\n%s", output.String())
+	}
+}
+
+func TestGenerateConfigTomlEnablesComputerUseFromOutputCodexHome(t *testing.T) {
+	t.Setenv("CODEX_HOME", "")
+	outputCodexHome := t.TempDir()
+	writeComputerUseClient(t, outputCodexHome)
+
+	var output bytes.Buffer
+	cfg := config.Config{
+		Models: map[string]config.ModelDef{
+			"gpt-test": {ContextWindow: 128000},
+		},
+		ProviderDefs: map[string]config.ProviderDef{
+			"openai": {
+				Offers: []config.OfferEntry{{Model: "gpt-test"}},
+			},
+		},
+		Routes: map[string]config.RouteEntry{
+			"test": {Provider: "openai", Model: "gpt-test"},
+		},
+	}
+
+	err := codex.GenerateConfigToml(&output, "test", "http://127.0.0.1:38440/v1", outputCodexHome,
+		config.ProviderFromGlobalConfig(&cfg), config.PluginFromGlobalConfig(&cfg), config.ServerFromGlobalConfig(&cfg))
+	if err != nil {
+		t.Fatalf("GenerateConfigToml() error = %v", err)
+	}
+	assertComputerUseEnabled(t, output.String(), outputCodexHome)
+}
+
+func writeComputerUseClient(t *testing.T, codexHome string) {
+	t.Helper()
+	clientPath := filepath.Join(codexHome,
+		"computer-use",
+		"Codex Computer Use.app",
+		"Contents",
+		"SharedSupport",
+		"SkyComputerUseClient.app",
+		"Contents",
+		"MacOS",
+		"SkyComputerUseClient")
+	if err := os.MkdirAll(filepath.Dir(clientPath), 0755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	if err := os.WriteFile(clientPath, []byte("#!/bin/sh\n"), 0755); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+}
+
+func assertComputerUseEnabled(t *testing.T, generatedConfig string, codexHome string) {
+	t.Helper()
+	if !strings.Contains(generatedConfig, `[plugins."computer-use@openai-bundled"]`) {
+		t.Fatalf("generated config missing computer-use plugin enablement:\n%s", generatedConfig)
+	}
+
+	raw, err := os.ReadFile(filepath.Join(codexHome, "models_catalog.json"))
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	var result struct {
+		Models []codex.ModelInfo `json:"models"`
+	}
+	if err := json.Unmarshal(raw, &result); err != nil {
+		t.Fatalf("JSON unmarshal error = %v", err)
+	}
+	if len(result.Models) == 0 {
+		t.Fatal("expected generated models")
+	}
+	for _, model := range result.Models {
+		found := false
+		for _, tool := range model.ExperimentalSupportedTools {
+			if tool == "computer_use" {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("model %q experimental tools = %v, want computer_use", model.Slug, model.ExperimentalSupportedTools)
+		}
+	}
+}
+
 func TestBuildModelInfoFromProviderModelIncludesInputModalities(t *testing.T) {
 	info := codex.BuildModelInfoFromProviderModel("gpt-4o(openai)", "openai", config.ModelMeta{
 		ContextWindow:   128000,

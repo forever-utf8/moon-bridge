@@ -5,6 +5,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"time"
 
 	mbtrace "moonbridge/internal/service/trace"
 )
@@ -53,6 +54,7 @@ func (server *AnthropicServer) ServeHTTP(writer http.ResponseWriter, request *ht
 func (server *AnthropicServer) serveProxy(writer http.ResponseWriter, request *http.Request) {
 	log := slog.Default().With("path", request.URL.Path, "method", request.Method)
 	log.Debug("代理请求已收到")
+	start := time.Now()
 	requestBody, err := io.ReadAll(request.Body)
 	if err != nil {
 		log.Error("读取请求体失败", "error", err)
@@ -104,8 +106,12 @@ func (server *AnthropicServer) serveProxy(writer http.ResponseWriter, request *h
 		Body:       mbtrace.RawJSONOrString(responseBody.Bytes()),
 	}
 	if copyErr != nil {
-		log.Error("复制上游响应失败", "error", copyErr)
-		record.Error = map[string]string{"stage": "copy_upstream_response", "message": copyErr.Error()}
+		if isDownstreamCanceledError(copyErr) {
+			logResponseCopyIssue(log, slog.LevelWarn, "下游取消响应复制", copyErr, request, upstreamResponse, targetURL, responseBody.Len(), time.Since(start))
+		} else {
+			logResponseCopyIssue(log, slog.LevelError, "复制上游响应失败", copyErr, request, upstreamResponse, targetURL, responseBody.Len(), time.Since(start))
+			record.Error = map[string]string{"stage": "copy_upstream_response", "message": copyErr.Error()}
+		}
 	}
 	log.Info("代理响应", "status", upstreamResponse.StatusCode, "bytes", responseBody.Len())
 	writeTrace(server.tracer, server.traceErrors, record)

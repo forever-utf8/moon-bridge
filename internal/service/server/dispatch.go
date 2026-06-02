@@ -2,12 +2,17 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
+	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"moonbridge/internal/config"
@@ -246,6 +251,239 @@ func shouldWriteChatTrace(record mbtrace.Record) bool {
 func traceError(stage string, err error) map[string]string {
 	return map[string]string{"stage": stage, "message": err.Error()}
 }
+
+func isDownstreamCanceledError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, http.ErrAbortHandler) ||
+		errors.Is(err, syscall.EPIPE) || errors.Is(err, syscall.ECONNRESET) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "context canceled") ||
+		strings.Contains(msg, "broken pipe") ||
+		strings.Contains(msg, "connection reset by peer") ||
+		strings.Contains(msg, "client disconnected") ||
+		strings.Contains(msg, "stream closed")
+}
+
+func logOpenAIResponseCopyIssue(log *slog.Logger, level slog.Level, message string, err error, request *http.Request, upstreamResponse *http.Response, requestModel, actualModel, upstreamURL string, stream bool, copiedBytes int64, elapsed time.Duration, diag *sseStreamDiagnostics) {
+	args := openAIResponseCopySummaryAttrs(requestModel, actualModel, stream, upstreamResponse.StatusCode, copiedBytes, elapsed)
+	if level < slog.LevelWarn {
+		if diag != nil {
+			diag.flushPending()
+			args = append(args, "sse_completed", diag.sawCompleted)
+		}
+		log.Log(context.Background(), level, message, args...)
+		return
+	}
+	args = append(args,
+		"error", err,
+		"downstream_canceled", isDownstreamCanceledError(err),
+		"request_uri", request.URL.RequestURI(),
+		"remote", request.RemoteAddr,
+		"user_agent", request.UserAgent(),
+		"accept", request.Header.Get("Accept"),
+		"content_type", upstreamResponse.Header.Get("Content-Type"),
+		"content_length", upstreamResponse.ContentLength,
+		"transfer_encoding", strings.Join(upstreamResponse.TransferEncoding, ","),
+	)
+	if parsed, parseErr := url.Parse(upstreamURL); parseErr == nil {
+		args = append(args, "upstream_host", parsed.Host, "upstream_path", parsed.Path)
+	}
+	if diag != nil {
+		diag.flushPending()
+		args = append(args, diag.logAttrs(level >= slog.LevelWarn)...)
+	}
+	log.Log(context.Background(), level, message, args...)
+}
+
+func openAIResponseCopySummaryAttrs(requestModel, actualModel string, stream bool, status int, copiedBytes int64, elapsed time.Duration) []any {
+	return []any{
+		"request_model", requestModel,
+		"actual_model", actualModel,
+		"stream", stream,
+		"status", status,
+		"bytes", copiedBytes,
+		"duration_ms", elapsed.Milliseconds(),
+	}
+}
+
+type sseStreamDiagnostics struct {
+	buffer          []byte
+	tail            []byte
+	eventsSeen      int
+	dataMessages    int
+	jsonParseErrors int
+	sawCompleted    bool
+	sawErrorEvent   bool
+	lastEvent       string
+	lastDataType    string
+	eventCounts     map[string]int
+}
+
+func newSSEStreamDiagnostics() *sseStreamDiagnostics {
+	return &sseStreamDiagnostics{eventCounts: make(map[string]int)}
+}
+
+func (d *sseStreamDiagnostics) wrap(dst io.Writer) io.Writer {
+	return &sseDiagnosticWriter{dst: dst, diag: d}
+}
+
+func (d *sseStreamDiagnostics) observe(chunk []byte) {
+	d.appendTail(chunk)
+	d.buffer = append(d.buffer, chunk...)
+	for {
+		idx, sepLen := nextSSESeparator(d.buffer)
+		if idx < 0 {
+			if len(d.buffer) > 64*1024 {
+				d.buffer = append([]byte(nil), d.buffer[len(d.buffer)-64*1024:]...)
+			}
+			return
+		}
+		block := append([]byte(nil), d.buffer[:idx]...)
+		d.buffer = d.buffer[idx+sepLen:]
+		d.observeBlock(block)
+	}
+}
+
+func (d *sseStreamDiagnostics) appendTail(chunk []byte) {
+	const maxTail = 2048
+	d.tail = append(d.tail, chunk...)
+	if len(d.tail) > maxTail {
+		d.tail = append([]byte(nil), d.tail[len(d.tail)-maxTail:]...)
+	}
+}
+
+func (d *sseStreamDiagnostics) observeBlock(block []byte) {
+	text := strings.ReplaceAll(string(block), "\r\n", "\n")
+	lines := strings.Split(text, "\n")
+	eventName := "message"
+	var dataLines []string
+	for _, line := range lines {
+		switch {
+		case strings.HasPrefix(line, "event:"):
+			if value := strings.TrimSpace(strings.TrimPrefix(line, "event:")); value != "" {
+				eventName = value
+			}
+		case strings.HasPrefix(line, "data:"):
+			dataLines = append(dataLines, strings.TrimSpace(strings.TrimPrefix(line, "data:")))
+		}
+	}
+	if len(dataLines) == 0 && strings.TrimSpace(text) == "" {
+		return
+	}
+	d.eventsSeen++
+	d.lastEvent = eventName
+	d.eventCounts[eventName]++
+	if eventName == "error" || strings.Contains(eventName, ".error") {
+		d.sawErrorEvent = true
+	}
+	if eventName == "response.completed" {
+		d.sawCompleted = true
+	}
+	if len(dataLines) == 0 {
+		return
+	}
+	d.dataMessages++
+	data := strings.Join(dataLines, "\n")
+	if data == "[DONE]" {
+		d.lastDataType = "[DONE]"
+		return
+	}
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(data), &payload); err != nil {
+		d.jsonParseErrors++
+		d.lastDataType = "invalid_json"
+		return
+	}
+	if typ, ok := payload["type"].(string); ok && typ != "" {
+		d.lastDataType = typ
+	}
+	if _, ok := payload["error"]; ok {
+		d.sawErrorEvent = true
+	}
+}
+
+func (d *sseStreamDiagnostics) flushPending() {
+	if len(bytes.TrimSpace(d.buffer)) == 0 {
+		return
+	}
+	block := append([]byte(nil), d.buffer...)
+	d.buffer = nil
+	d.observeBlock(block)
+}
+
+func (d *sseStreamDiagnostics) logAttrs(includeTail bool) []any {
+	attrs := []any{
+		"sse_events_seen", d.eventsSeen,
+		"sse_data_messages", d.dataMessages,
+		"sse_last_event", d.lastEvent,
+		"sse_last_data_type", d.lastDataType,
+		"sse_saw_response_completed", d.sawCompleted,
+		"sse_saw_error_event", d.sawErrorEvent,
+		"sse_json_parse_errors", d.jsonParseErrors,
+		"sse_event_counts", d.eventCountsString(),
+	}
+	if includeTail {
+		attrs = append(attrs, "sse_tail", sanitizeLogExcerpt(string(d.tail)))
+	}
+	return attrs
+}
+
+func (d *sseStreamDiagnostics) completedCleanly() bool {
+	if d == nil {
+		return false
+	}
+	d.flushPending()
+	return d.sawCompleted && !d.sawErrorEvent && d.jsonParseErrors == 0
+}
+
+func (d *sseStreamDiagnostics) eventCountsString() string {
+	keys := make([]string, 0, len(d.eventCounts))
+	for key := range d.eventCounts {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, key := range keys {
+		parts = append(parts, fmt.Sprintf("%s:%d", key, d.eventCounts[key]))
+	}
+	return strings.Join(parts, ",")
+}
+
+type sseDiagnosticWriter struct {
+	dst  io.Writer
+	diag *sseStreamDiagnostics
+}
+
+func (w *sseDiagnosticWriter) Write(p []byte) (int, error) {
+	n, err := w.dst.Write(p)
+	if n > 0 {
+		w.diag.observe(p[:n])
+	}
+	return n, err
+}
+
+func nextSSESeparator(data []byte) (int, int) {
+	if idx := bytes.Index(data, []byte("\n\n")); idx >= 0 {
+		return idx, 2
+	}
+	if idx := bytes.Index(data, []byte("\r\n\r\n")); idx >= 0 {
+		return idx, 4
+	}
+	return -1, 0
+}
+
+func sanitizeLogExcerpt(value string) string {
+	value = strings.ReplaceAll(value, "\r\n", "\n")
+	value = strings.ReplaceAll(value, "\r", "\n")
+	value = strings.ReplaceAll(value, "\n", "\\n")
+	value = strings.ReplaceAll(value, "\t", "\\t")
+	return value
+}
+
 func writeJSON(writer http.ResponseWriter, status int, payload any) {
 	writer.Header().Set("Content-Type", "application/json")
 	writer.WriteHeader(status)
@@ -491,9 +729,23 @@ func (server *Server) handleOpenAIResponse(writer http.ResponseWriter, request *
 		if shouldCapture {
 			target = io.MultiWriter(writer, &captured)
 		}
-		if _, err := io.Copy(target, upstreamResp.Body); err != nil {
-			hookErr = "copy upstream response"
-			log.Error("复制上游响应失败", "error", err)
+		var sseDiag *sseStreamDiagnostics
+		if responsesRequest.Stream || strings.Contains(upstreamResp.Header.Get("Content-Type"), "text/event-stream") {
+			sseDiag = newSSEStreamDiagnostics()
+			target = sseDiag.wrap(target)
+		}
+		copiedBytes, err := io.Copy(target, upstreamResp.Body)
+		if err != nil {
+			if isDownstreamCanceledError(err) {
+				if sseDiag.completedCleanly() {
+					logOpenAIResponseCopyIssue(log, slog.LevelInfo, "响应流完成后下游关闭连接", err, request, upstreamResp, responsesRequest.Model, upstreamRequest.Model, upstreamURL, responsesRequest.Stream, copiedBytes, time.Since(proxyStart), sseDiag)
+				} else {
+					logOpenAIResponseCopyIssue(log, slog.LevelWarn, "下游取消响应复制", err, request, upstreamResp, responsesRequest.Model, upstreamRequest.Model, upstreamURL, responsesRequest.Stream, copiedBytes, time.Since(proxyStart), sseDiag)
+				}
+			} else {
+				hookErr = "copy upstream response"
+				logOpenAIResponseCopyIssue(log, slog.LevelError, "复制上游响应失败", err, request, upstreamResp, responsesRequest.Model, upstreamRequest.Model, upstreamURL, responsesRequest.Stream, copiedBytes, time.Since(proxyStart), sseDiag)
+			}
 			return
 		}
 

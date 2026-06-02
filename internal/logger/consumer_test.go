@@ -2,6 +2,7 @@ package logger
 
 import (
 	"bytes"
+	"encoding/json"
 	"log/slog"
 	"strings"
 	"testing"
@@ -127,5 +128,32 @@ func TestConsumeHandler_WithGroup_VisibleToConsumer(t *testing.T) {
 	}
 	if !foundGroup {
 		t.Fatalf("expected request group in attrs, got: %v", received[0].Attrs)
+	}
+}
+
+func TestConsumeHandler_DoesNotDuplicateWithAttrsInOutput(t *testing.T) {
+	var buf bytes.Buffer
+	Init(Config{Level: LevelInfo, Format: "json", Output: &buf})
+
+	SetConsumeFunc(func(entries []LogEntry) []LogEntry {
+		return entries
+	})
+
+	slog.Default().With("provider", "jdcloud-response", "attempt", 1).Error("复制上游响应失败", "error", "context canceled")
+
+	line := buf.String()
+	if strings.Count(line, `"provider"`) != 1 {
+		t.Fatalf("provider attr count = %d, output = %s", strings.Count(line, `"provider"`), line)
+	}
+	if strings.Count(line, `"attempt"`) != 1 {
+		t.Fatalf("attempt attr count = %d, output = %s", strings.Count(line, `"attempt"`), line)
+	}
+
+	var decoded map[string]any
+	if err := json.Unmarshal(buf.Bytes(), &decoded); err != nil {
+		t.Fatalf("log output is not valid JSON: %v; output = %s", err, line)
+	}
+	if decoded["provider"] != "jdcloud-response" || decoded["attempt"] != float64(1) {
+		t.Fatalf("decoded attrs = %+v", decoded)
 	}
 }

@@ -65,6 +65,7 @@ type TruncationPolicyConfig struct {
 
 const (
 	defaultApplyPatchToolType = "freeform"
+	computerUseToolName       = "computer_use"
 	// DefaultCatalogTruncationLimit keeps shell tool output from being clamped
 	// to zero while using a consistent token policy across generated models.
 	DefaultCatalogTruncationLimit int64 = 10000
@@ -439,9 +440,17 @@ func truncationPolicyForModel(string) TruncationPolicyConfig {
 // WriteModelsCatalog generates a Codex-compatible models_catalog.json from
 // provider model catalogs, with routes appended as fallback aliases.
 func WriteModelsCatalog(path string, providerCfg config.ProviderConfig, pluginCfg config.PluginConfig) error {
+	return writeModelsCatalog(path, providerCfg, pluginCfg, nil)
+}
+
+func writeModelsCatalog(path string, providerCfg config.ProviderConfig, pluginCfg config.PluginConfig, experimentalTools []string) error {
+	models := BuildModelInfosFromConfig(providerCfg, pluginCfg)
+	if len(experimentalTools) > 0 {
+		models = withExperimentalTools(models, experimentalTools)
+	}
 	catalog := struct {
 		Models []ModelInfo `json:"models"`
-	}{Models: BuildModelInfosFromConfig(providerCfg, pluginCfg)}
+	}{Models: models}
 	data, err := json.MarshalIndent(catalog, "", "  ")
 	if err != nil {
 		return err
@@ -450,6 +459,26 @@ func WriteModelsCatalog(path string, providerCfg config.ProviderConfig, pluginCf
 		return err
 	}
 	return os.WriteFile(path, data, 0644)
+}
+
+func withExperimentalTools(models []ModelInfo, tools []string) []ModelInfo {
+	if len(tools) == 0 {
+		return models
+	}
+	for i := range models {
+		seen := make(map[string]bool, len(models[i].ExperimentalSupportedTools)+len(tools))
+		for _, tool := range models[i].ExperimentalSupportedTools {
+			seen[tool] = true
+		}
+		for _, tool := range tools {
+			if tool == "" || seen[tool] {
+				continue
+			}
+			models[i].ExperimentalSupportedTools = append(models[i].ExperimentalSupportedTools, tool)
+			seen[tool] = true
+		}
+	}
+	return models
 }
 
 func valueOrDefault(value string, fallback string) string {
@@ -494,6 +523,11 @@ func routeFor(providerCfg config.ProviderConfig, modelAlias string) config.Route
 // there and adds a model_catalog_json pointer.
 func GenerateConfigToml(output io.Writer, modelAlias string, baseURL string, codexHome string, providerCfg config.ProviderConfig, pluginCfg config.PluginConfig, serverCfg config.ServerConfig) error {
 	route := routeFor(providerCfg, modelAlias)
+	computerUseEnabled := computerUseClientExists(codexHome)
+	var experimentalTools []string
+	if computerUseEnabled {
+		experimentalTools = append(experimentalTools, computerUseToolName)
+	}
 
 	// When modelAlias is a direct provider/model reference (not a named route),
 	// normalize to model(provider) format so Codex can match it against catalog slugs.
@@ -516,7 +550,7 @@ func GenerateConfigToml(output io.Writer, modelAlias string, baseURL string, cod
 	// Write models catalog JSON so Codex uses our metadata instead of bundled presets.
 	if codexHome != "" {
 		catalogPath := filepath.Join(codexHome, "models_catalog.json")
-		if err := WriteModelsCatalog(catalogPath, providerCfg, pluginCfg); err != nil {
+		if err := writeModelsCatalog(catalogPath, providerCfg, pluginCfg, experimentalTools); err != nil {
 			return fmt.Errorf("write models catalog: %w", err)
 		}
 		fmt.Fprintf(output, "model_catalog_json = %q\n", catalogPath)
@@ -540,7 +574,33 @@ func GenerateConfigToml(output io.Writer, modelAlias string, baseURL string, cod
 	fmt.Fprintln(output, `url = "https://mcp.deepwiki.com/mcp"`)
 	fmt.Fprintln(output, "startup_timeout_sec = 3600")
 	fmt.Fprintln(output, "tool_timeout_sec = 3600")
+	if computerUseEnabled {
+		fmt.Fprintln(output)
+		fmt.Fprintln(output, `[plugins."computer-use@openai-bundled"]`)
+		fmt.Fprintln(output, "enabled = true")
+	}
 	return nil
+}
+
+func computerUseClientExists(codexHome string) bool {
+	codexHome = strings.TrimSpace(codexHome)
+	if codexHome == "" {
+		return false
+	}
+	clientPath := filepath.Join(codexHome,
+		"computer-use",
+		"Codex Computer Use.app",
+		"Contents",
+		"SharedSupport",
+		"SkyComputerUseClient.app",
+		"Contents",
+		"MacOS",
+		"SkyComputerUseClient")
+	info, err := os.Stat(clientPath)
+	if err != nil {
+		return false
+	}
+	return !info.IsDir()
 }
 
 // writeAuthJSON writes the API key into Codex's auth.json so that model_providers

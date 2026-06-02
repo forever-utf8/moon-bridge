@@ -120,6 +120,47 @@ func TestResolvePerProviderWebSearchOpenAIResponseEnabled(t *testing.T) {
 	}
 }
 
+func TestResolvePerProviderWebSearchOpenAIResponseRouteInheritsInjectedAsDisabled(t *testing.T) {
+	cfg := config.Config{
+		WebSearchSupport: config.WebSearchSupportInjected,
+		TavilyAPIKey:     "tavily-key",
+		SearchMaxRounds:  3,
+		ProviderDefs: map[string]config.ProviderDef{
+			"jdcloud-response": {},
+		},
+		Routes: map[string]config.RouteEntry{
+			"gpt-5.5": {Provider: "jdcloud-response", Model: "GPT-5.5"},
+		},
+	}
+	pm, err := provider.NewProviderManager(
+		map[string]provider.ProviderConfig{
+			"jdcloud-response": {
+				BaseURL:  "https://modelservice.jdcloud.com/v1/responses",
+				APIKey:   "key",
+				Protocol: config.ProtocolOpenAIResponse,
+			},
+		},
+		map[string]provider.ModelRoute{
+			"gpt-5.5": {Provider: "jdcloud-response", Name: "GPT-5.5"},
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resolvePerProviderWebSearch(context.Background(), cfg, pm, &bytes.Buffer{})
+
+	if got := pm.ResolvedWebSearch("jdcloud-response"); got != "disabled" {
+		t.Fatalf("ResolvedWebSearch(jdcloud-response) = %q, want disabled", got)
+	}
+	if got := pm.ResolvedWebSearchForModel("gpt-5.5"); got != "disabled" {
+		t.Fatalf("ResolvedWebSearchForModel(gpt-5.5) = %q, want disabled", got)
+	}
+	if got := pm.ResolvedWebSearchForCandidate("jdcloud-response", "GPT-5.5"); got != "disabled" {
+		t.Fatalf("ResolvedWebSearchForCandidate() = %q, want disabled", got)
+	}
+}
+
 func TestResolvePerProviderWebSearchFallsBackToGlobal(t *testing.T) {
 	cfg := config.Config{
 		WebSearchSupport: config.WebSearchSupportDisabled,

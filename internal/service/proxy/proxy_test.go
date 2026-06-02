@@ -1,8 +1,11 @@
 package proxy_test
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -18,6 +21,86 @@ type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (fn roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
 	return fn(request)
+}
+
+func TestResponseProxyTreatsCanceledCopyAsClientDisconnect(t *testing.T) {
+	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       &canceledReadCloser{prefix: []byte("data: {}\n\n")},
+		}, nil
+	})}
+
+	traceRoot := t.TempDir()
+	handler, err := proxy.NewResponse(proxy.ResponseConfig{
+		UpstreamBaseURL: "https://upstream.example/v1",
+		Client:          client,
+		Tracer:          mbtrace.New(mbtrace.Config{Enabled: true, Root: traceRoot, SessionID: "cancel"}),
+	})
+	if err != nil {
+		t.Fatalf("NewResponse() error = %v", err)
+	}
+
+	var logOutput bytes.Buffer
+	originalLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&logOutput, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() {
+		slog.SetDefault(originalLogger)
+	})
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"hello"}`))
+	request.Header.Set("User-Agent", "proxy-test")
+	request.Header.Set("Accept", "text/event-stream")
+	recorder := httptest.NewRecorder()
+
+	handler.ServeHTTP(recorder, request)
+
+	traceData, err := os.ReadFile(filepath.Join(traceRoot, "cancel", "1.json"))
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	if strings.Contains(string(traceData), `"error"`) {
+		t.Fatalf("canceled copy should not be traced as upstream error: %s", string(traceData))
+	}
+	logs := logOutput.String()
+	if strings.Contains(logs, `"level":"ERROR"`) || strings.Contains(logs, "复制上游响应失败") {
+		t.Fatalf("canceled copy should not be logged as error: %s", logs)
+	}
+	for _, want := range []string{
+		`"level":"WARN"`,
+		`"msg":"下游取消响应复制"`,
+		`"downstream_canceled":true`,
+		`"status":200`,
+		`"bytes":10`,
+		`"request_uri":"/v1/responses"`,
+		`"user_agent":"proxy-test"`,
+		`"accept":"text/event-stream"`,
+		`"content_type":"text/event-stream"`,
+		`"upstream_host":"upstream.example"`,
+		`"upstream_path":"/v1/responses"`,
+	} {
+		if !strings.Contains(logs, want) {
+			t.Fatalf("diagnostic log missing %q: %s", want, logs)
+		}
+	}
+}
+
+type canceledReadCloser struct {
+	prefix []byte
+}
+
+func (r *canceledReadCloser) Read(p []byte) (int, error) {
+	if len(r.prefix) > 0 {
+		n := copy(p, r.prefix)
+		r.prefix = r.prefix[n:]
+		return n, nil
+	}
+	return 0, context.Canceled
+}
+
+func (*canceledReadCloser) Close() error {
+	return nil
 }
 
 func TestResponseProxyPassesHeadersThroughAndCapturesTrace(t *testing.T) {

@@ -46,16 +46,18 @@ func (s *consumeState) store(fn ConsumeFunc) {
 // handlerAttrs / handlerGroups and merged into LogEntry.Attrs before
 // dispatching to the consume pipeline, so consumers see the full context.
 type consumeHandler struct {
-	inner        slog.Handler
-	consume      *consumeState
-	handlerAttrs []slog.Attr   // attrs from WithAttrs calls
-	handlerGroups []string     // groups from WithGroup calls
+	inner         slog.Handler
+	output        slog.Handler
+	consume       *consumeState
+	handlerAttrs  []slog.Attr // attrs from WithAttrs calls
+	handlerGroups []string    // groups from WithGroup calls
 }
 
 // newConsumeHandler wraps the given handler with consume-function support.
 func newConsumeHandler(inner slog.Handler) *consumeHandler {
 	return &consumeHandler{
 		inner:   inner,
+		output:  inner,
 		consume: &consumeState{},
 	}
 }
@@ -117,7 +119,7 @@ func (h *consumeHandler) Handle(ctx context.Context, r slog.Record) error {
 	for _, a := range result[0].Attrs {
 		rebuilt.AddAttrs(a)
 	}
-	return h.inner.Handle(ctx, rebuilt)
+	return h.output.Handle(ctx, rebuilt)
 }
 
 // WithAttrs returns a new handler with the given attributes prepended.
@@ -129,9 +131,10 @@ func (h *consumeHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 	copy(combined, h.handlerAttrs)
 	combined = append(combined, attrs...)
 	return &consumeHandler{
-		inner:        h.inner.WithAttrs(attrs),
-		consume:      h.consume,
-		handlerAttrs: combined,
+		inner:         h.inner.WithAttrs(attrs),
+		output:        h.output,
+		consume:       h.consume,
+		handlerAttrs:  combined,
 		handlerGroups: h.handlerGroups,
 	}
 }
@@ -143,6 +146,7 @@ func (h *consumeHandler) WithGroup(name string) slog.Handler {
 	groups = append(groups, name)
 	return &consumeHandler{
 		inner:         h.inner.WithGroup(name),
+		output:        h.output,
 		consume:       h.consume,
 		handlerAttrs:  h.handlerAttrs,
 		handlerGroups: groups,
